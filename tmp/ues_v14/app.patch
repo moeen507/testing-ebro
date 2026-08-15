@@ -1,0 +1,200 @@
+--- app.js
++++ app.js
+@@ -5,7 +5,7 @@
+   const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_IK5lGzRL54YSSjrWGGOn8g_Flup_ROt';
+   const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+     auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+-    global: { headers: { 'x-client-info': 'ues-peopleos-web/1.3.0' } }
++    global: { headers: { 'x-client-info': 'ues-peopleos-web/1.4.0' } }
+   });
+ 
+   const $ = (s, root=document) => root.querySelector(s);
+@@ -58,7 +58,7 @@
+ 
+   const state = {
+     session:null,user:null,profile:null,role:'employee',page:null,
+-    departments:[],shifts:[],leaveTypes:[],realtime:[],lastPayrollRun:null,importPreview:null
++    departments:[],shifts:[],leaveTypes:[],realtime:[],lastPayrollRun:null,importPreview:null,preferences:null,avatarUrl:null
+   };
+ 
+   const adminNav = {
+@@ -109,6 +109,70 @@
+     if(error) throw error;
+     state.profile=data||null; state.role=data?.role||'employee';
+     return data;
++  }
++
++  function applyAppearance(){
++    const pref=state.preferences||{};
++    document.body.dataset.theme=pref.theme||'signature';
++    document.body.dataset.motion=pref.motion||'full';
++  }
++
++  async function loadPreferences(){
++    if(!state.user) return null;
++    let {data,error}=await db.from('user_preferences').select('*').eq('auth_user_id',state.user.id).maybeSingle();
++    if(error) throw error;
++    if(!data){
++      const created={auth_user_id:state.user.id,theme:'signature',motion:'full'};
++      const res=await db.from('user_preferences').insert(created).select().single();
++      if(res.error) throw res.error;
++      data=res.data;
++    }
++    state.preferences=data; state.avatarUrl=null;
++    if(data.avatar_path){
++      const signed=await db.storage.from('employee-avatars').createSignedUrl(data.avatar_path,86400);
++      if(!signed.error) state.avatarUrl=signed.data.signedUrl;
++    }
++    applyAppearance();
++    return data;
++  }
++
++  function avatarMarkup(name,cls='avatar'){
++    const fallback=esc(initials(name));
++    return state.avatarUrl ? `<span class="${cls} has-photo"><img src="${esc(state.avatarUrl)}" alt="${esc(name||'Profile photo')}"></span>` : `<span class="${cls}">${fallback}</span>`;
++  }
++
++  function paintAvatar(el,name){
++    if(!el)return; el.classList.toggle('has-photo',!!state.avatarUrl);
++    el.innerHTML=state.avatarUrl?`<img src="${esc(state.avatarUrl)}" alt="${esc(name||'Profile photo')}">`:esc(initials(name));
++  }
++
++  async function savePreference(patch){
++    if(!state.user)return;
++    const payload={auth_user_id:state.user.id,...patch,updated_at:new Date().toISOString()};
++    const {data,error}=await db.from('user_preferences').upsert(payload,{onConflict:'auth_user_id'}).select().single();
++    if(error) return toast('Preference not saved',error.message,'bad');
++    state.preferences={...(state.preferences||{}),...data}; applyAppearance();
++    if(state.page==='Profile') await go('Profile',true);
++  }
++
++  async function uploadAvatar(file){
++    if(!file)return;
++    if(!['image/jpeg','image/png','image/webp'].includes(file.type)) return toast('Unsupported photo','Use JPG, PNG or WebP.','bad');
++    if(file.size>3*1024*1024) return toast('Photo is too large','Maximum profile photo size is 3 MB.','bad');
++    const ext=({'image/jpeg':'jpg','image/png':'png','image/webp':'webp'})[file.type]||'img';
++    const path=`${state.user.id}/avatar-${Date.now()}.${ext}`;
++    const btn=$('[data-action="upload-avatar"]'); if(btn){btn.disabled=true;btn.textContent='Uploading…';}
++    const uploaded=await db.storage.from('employee-avatars').upload(path,file,{cacheControl:'3600',upsert:false,contentType:file.type});
++    if(uploaded.error){if(btn){btn.disabled=false;btn.textContent='Change photo';}return toast('Photo upload failed',uploaded.error.message,'bad');}
++    const old=state.preferences?.avatar_path;
++    const {data,error}=await db.from('user_preferences').upsert({auth_user_id:state.user.id,avatar_path:path,updated_at:new Date().toISOString()},{onConflict:'auth_user_id'}).select().single();
++    if(error){await db.storage.from('employee-avatars').remove([path]);if(btn){btn.disabled=false;btn.textContent='Change photo';}return toast('Photo not saved',error.message,'bad');}
++    if(old && old!==path) db.storage.from('employee-avatars').remove([old]);
++    state.preferences={...(state.preferences||{}),...data};
++    const signed=await db.storage.from('employee-avatars').createSignedUrl(path,86400); state.avatarUrl=signed.error?null:signed.data.signedUrl;
++    applyProfileChrome(); closeProfileMenu(); if(btn){btn.disabled=false;btn.textContent='Change photo';}
++    toast('Profile photo updated','Your new private profile image is active.');
++    if(state.page==='Profile') await go('Profile',true);
+   }
+ 
+   function renderBottomNav(){
+@@ -141,8 +205,21 @@
+     const name=state.profile?.full_name || state.user?.email || 'UES User';
+     const role=humanRole(state.role);
+     $('#miniName').textContent=name; $('#miniRole').textContent=role;
+-    $('#miniAvatar').textContent=initials(name); $('#topAvatar').textContent=initials(name);
++    $('#topProfileName').textContent=name; $('#topProfileRole').textContent=role;
++    $('#menuName').textContent=name; $('#menuRole').textContent=role;
++    paintAvatar($('#miniAvatar'),name); paintAvatar($('#topAvatar'),name); paintAvatar($('#menuAvatar'),name);
+     $('#footerUser').textContent=`Signed in as ${name} · ${role}`;
++  }
++
++  function openProfileMenu(){ const menu=$('#profileMenu'),trigger=$('#profileTrigger'); if(!menu)return; menu.classList.remove('hidden'); trigger?.setAttribute('aria-expanded','true'); }
++  function closeProfileMenu(){ const menu=$('#profileMenu'),trigger=$('#profileTrigger'); menu?.classList.add('hidden'); trigger?.setAttribute('aria-expanded','false'); }
++  function toggleProfileMenu(){ $('#profileMenu')?.classList.contains('hidden')?openProfileMenu():closeProfileMenu(); }
++  async function handleAccountAction(action){
++    closeProfileMenu();
++    if(action==='logout') return db.auth.signOut();
++    if(action==='photo') return $('#avatarFileInput')?.click();
++    if(action==='profile'){ await go('Profile'); return; }
++    if(action==='appearance'){ await go('Profile'); setTimeout(()=>$('#appearanceSettings')?.scrollIntoView({behavior:'smooth',block:'center'}),120); }
+   }
+ 
+   async function go(page, refresh=false){
+@@ -311,8 +388,24 @@
+   }
+ 
+   async function renderProfile(){
+-    const e=state.profile;
+-    return pageHead('My profile','Employment identity linked to your secure login.')+`<div class="panel profile-card"><div><div class="profile-photo">${initials(e.full_name)}</div></div><div><span class="eyebrow">${esc(e.employee_code)}</span><h2 style="margin:5px 0 2px;font-size:22px">${esc(e.full_name)}</h2><div class="muted">${esc(e.designation||'Employee')} · ${esc(e.departments?.name||'Unassigned')}</div><div class="info-grid"><div class="info-cell"><small>Email</small><b>${esc(e.email||'—')}</b></div><div class="info-cell"><small>Phone</small><b>${esc(e.phone||'—')}</b></div><div class="info-cell"><small>Joining Date</small><b>${fmtDate(e.joining_date)}</b></div><div class="info-cell"><small>Employment</small><b>${esc(e.employment_type||'—')}</b></div><div class="info-cell"><small>Shift</small><b>${esc(e.shifts?.name||'—')}</b></div><div class="info-cell"><small>Biometric ID</small><b>${esc(e.biometric_user_id||'Not mapped')}</b></div><div class="info-cell"><small>Portal Role</small><b>${humanRole(e.role)}</b></div><div class="info-cell"><small>Account</small><b class="positive">Linked</b></div><div class="info-cell"><small>Employee Status</small><b>${e.active?'Active':'Inactive'}</b></div></div></div></div>`;
++    const e=state.profile,p=state.preferences||{theme:'signature',motion:'full'};
++    const photo=state.avatarUrl?`<img src="${esc(state.avatarUrl)}" alt="${esc(e.full_name)}">`:esc(initials(e.full_name));
++    const themes=[['signature','Signature Glass','UES maroon + champagne'],['obsidian','Obsidian','Near-black executive finish'],['deep_maroon','Deep Maroon','Richer UES brand atmosphere']];
++    return pageHead('Profile & appearance','Your personal account controls. HR master data remains protected.')+`
++      <div class="profile-layout">
++        <section class="panel profile-identity-card">
++          <div class="profile-photo-wrap"><div class="profile-photo ${state.avatarUrl?'has-photo':''}">${photo}</div><span class="photo-status">Private profile image</span></div>
++          <div class="profile-identity-copy"><span class="eyebrow">${esc(e.employee_code)}</span><h2>${esc(e.full_name)}</h2><p>${esc(e.designation||'Employee')} · ${esc(e.departments?.name||'Unassigned')}</p>
++            <div class="profile-actions"><button class="btn primary" data-action="upload-avatar">📷 Change photo</button><button class="btn" data-action="account-logout">Sign out</button></div>
++          </div>
++        </section>
++        <section id="appearanceSettings" class="panel appearance-panel">
++          ${panelHead('Appearance','Personalize this device and account','PERSONAL')}
++          <div class="theme-choice-grid">${themes.map(([value,title,desc])=>`<button class="theme-choice ${p.theme===value?'active':''}" data-theme-option="${value}"><span class="theme-preview ${value}"><i></i><i></i><i></i></span><b>${title}</b><small>${desc}</small>${p.theme===value?'<em>Selected</em>':''}</button>`).join('')}</div>
++          <div class="motion-setting"><div><b>Interface motion</b><small>Smooth transitions and premium feedback animations.</small></div><div class="segmented"><button data-motion-option="full" class="${p.motion!=='reduced'?'active':''}">Full motion</button><button data-motion-option="reduced" class="${p.motion==='reduced'?'active':''}">Reduced</button></div></div>
++        </section>
++      </div>
++      <div class="panel profile-details-panel">${panelHead('Employment details','Read-only information managed by authorized HR roles','SECURE MASTER DATA')}<div class="info-grid"><div class="info-cell"><small>Email</small><b>${esc(e.email||'—')}</b></div><div class="info-cell"><small>Phone</small><b>${esc(e.phone||'—')}</b></div><div class="info-cell"><small>Joining Date</small><b>${fmtDate(e.joining_date)}</b></div><div class="info-cell"><small>Employment</small><b>${esc(e.employment_type||'—')}</b></div><div class="info-cell"><small>Shift</small><b>${esc(e.shifts?.name||'—')}</b></div><div class="info-cell"><small>Biometric ID</small><b>${esc(e.biometric_user_id||'Not mapped')}</b></div><div class="info-cell"><small>Portal Role</small><b>${humanRole(e.role)}</b></div><div class="info-cell"><small>Account</small><b class="positive">Securely linked</b></div><div class="info-cell"><small>Employee Status</small><b>${e.active?'Active':'Inactive'}</b></div></div></div>`;
+   }
+ 
+   function employeeForm(employee=null){
+@@ -469,6 +562,10 @@
+     const as=$('#attendanceSearch'), ast=$('#attendanceStatus'); if(as){ const f=()=>{$$('#attendanceRows tr').forEach(r=>r.style.display=(r.dataset.search.includes(as.value.toLowerCase())&&(!ast.value||r.dataset.status===ast.value))?'':'none');}; as.oninput=f;ast.onchange=f; }
+     const ls=$('#leaveSearch'); if(ls)ls.oninput=()=>$$('#leaveRows tr').forEach(r=>r.style.display=r.dataset.search.includes(ls.value.toLowerCase())?'':'none');
+     const ps=$('#payrollSearch'); if(ps)ps.oninput=()=>$$('#payrollRows tr').forEach(r=>r.style.display=r.dataset.search.includes(ps.value.toLowerCase())?'':'none');
++    $$('[data-action="upload-avatar"]').forEach(x=>x.onclick=()=>$('#avatarFileInput')?.click());
++    $$('[data-action="account-logout"]').forEach(x=>x.onclick=()=>db.auth.signOut());
++    $$('[data-theme-option]').forEach(x=>x.onclick=()=>savePreference({theme:x.dataset.themeOption}));
++    $$('[data-motion-option]').forEach(x=>x.onclick=()=>savePreference({motion:x.dataset.motionOption}));
+   }
+   function wireModal(){
+     $$('[data-action="close-modal"]',$('#modal')).forEach(x=>x.onclick=closeModal);
+@@ -488,29 +585,28 @@
+   async function enterApp(){
+     $('#authView').classList.add('hidden'); $('#appView').classList.remove('hidden');
+     setLoading('Loading secure employee profile…');
+-    try{ await loadProfile(); if(!state.profile){ $('#content').innerHTML=empty('🔒','Account is not linked to an employee','Your login is valid, but this email has not been linked to an active UES employee profile. Ask HR to create or update your employee record, then sign in again.',button('Sign out','btn','id="unlinkedLogout"')); $('#unlinkedLogout').onclick=()=>db.auth.signOut(); return; } await loadReferenceData(); state.page=defaultPage(); applyProfileChrome(); renderNav(); refreshSyncMini(); subscribeRealtime(); await go(state.page); }
++    try{ await loadProfile(); if(!state.profile){ $('#content').innerHTML=empty('🔒','Account is not linked to an employee','Your login is valid, but this email has not been linked to an active UES employee profile. Ask HR to create or update your employee record, then sign in again.',button('Sign out','btn','id="unlinkedLogout"')); $('#unlinkedLogout').onclick=()=>db.auth.signOut(); return; } await Promise.all([loadReferenceData(),loadPreferences()]); state.page=defaultPage(); applyProfileChrome(); renderNav(); refreshSyncMini(); subscribeRealtime(); await go(state.page); }
+     catch(e){ console.error(e); $('#content').innerHTML=empty('!','Profile loading failed',e.message||''); }
+   }
+-  function leaveApp(){ state.realtime.forEach(ch=>db.removeChannel(ch)); state.realtime=[]; state.session=state.user=state.profile=null; state.page=null; $('#appView').classList.add('hidden'); $('#authView').classList.remove('hidden'); }
++  function leaveApp(){ state.realtime.forEach(ch=>db.removeChannel(ch)); state.realtime=[]; state.session=state.user=state.profile=null; state.preferences=null;state.avatarUrl=null; state.page=null; closeProfileMenu(); $('#appView').classList.add('hidden'); $('#authView').classList.remove('hidden'); }
+ 
+   let interactiveSignin=false;
+   const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+   function resetAuthVisuals(){
+     const card=$('.auth-card'); if(card) card.classList.remove('auth-error','auth-success','auth-checking');
+     $$('#signinForm input').forEach(x=>x.classList.remove('input-error','input-success'));
+-    const feedback=$('#authFeedback'); if(feedback){ feedback.classList.remove('show','bad'); feedback.querySelector('.auth-feedback-icon').textContent='✓'; feedback.querySelector('b').textContent='Identity verified'; feedback.querySelector('small').textContent='Opening your secure workspace…'; }
++    const pop=$('#authStatusPop'); if(pop){pop.classList.remove('show','bad','good');} const feedback=$('#authFeedback'); if(feedback){ feedback.classList.remove('show','bad'); feedback.querySelector('.auth-feedback-icon').textContent='✅'; feedback.querySelector('b').textContent='Identity verified'; feedback.querySelector('small').textContent='Opening your secure workspace…'; }
+   }
+   function authFailureVisual(message='Email or password is incorrect.'){
+     const card=$('.auth-card'); resetAuthVisuals(); void card?.offsetWidth; card?.classList.add('auth-error');
+     $$('#signinForm input').forEach(x=>x.classList.add('input-error'));
+-    const feedback=$('#authFeedback'); if(feedback){ feedback.classList.add('show','bad'); feedback.querySelector('.auth-feedback-icon').textContent='!'; feedback.querySelector('b').textContent='Sign-in not verified'; feedback.querySelector('small').textContent=message; }
+-    setTimeout(()=>card?.classList.remove('auth-error'),650);
++    const feedback=$('#authFeedback'); if(feedback){ feedback.classList.add('show','bad'); feedback.querySelector('.auth-feedback-icon').textContent='❌'; feedback.querySelector('b').textContent='Sign-in not verified'; feedback.querySelector('small').textContent=message; }
++    const pop=$('#authStatusPop'); if(pop){$('#authStatusEmoji').textContent='❌';$('#authStatusTitle').textContent='Access not verified';$('#authStatusDetail').textContent=message;pop.classList.add('show','bad');setTimeout(()=>pop.classList.remove('show'),1700);} setTimeout(()=>card?.classList.remove('auth-error'),650);
+   }
+   async function authSuccessVisual(){
+     const card=$('.auth-card'); resetAuthVisuals(); card?.classList.add('auth-success');
+     $$('#signinForm input').forEach(x=>x.classList.add('input-success'));
+-    $('#authFeedback')?.classList.add('show');
+-    await sleep(720);
++    $('#authFeedback')?.classList.add('show'); const pop=$('#authStatusPop'); if(pop){$('#authStatusEmoji').textContent='✅';$('#authStatusTitle').textContent='Welcome back';$('#authStatusDetail').textContent='Identity verified · opening PeopleOS';pop.classList.add('show','good');} await sleep(900);
+   }
+   async function handleSignin(e){
+     e.preventDefault(); resetAuthVisuals();
+@@ -534,8 +630,9 @@
+ 
+   async function init(){
+     $('#signinForm').addEventListener('submit',handleSignin); $('#signupForm').addEventListener('submit',handleSignup); $('#forgotBtn').onclick=forgotPassword;
+-    $$('[data-auth-tab]').forEach(b=>b.onclick=()=>{ $$('[data-auth-tab]').forEach(x=>x.classList.toggle('active',x===b)); $('#signinForm').classList.toggle('hidden',b.dataset.authTab!=='signin'); $('#signupForm').classList.toggle('hidden',b.dataset.authTab!=='signup'); });
+-    $('#logoutBtn').onclick=()=>db.auth.signOut(); $('#refreshBtn').onclick=()=>go(state.page,true); $('#openNav').onclick=openNav; $('#closeNav').onclick=closeNav; $('#navBackdrop').onclick=closeNav; $('#modalClose').onclick=closeModal; $('#modal').addEventListener('click',e=>{if(e.target===$('#modal'))closeModal();});
++    const passwordToggle=$('#passwordToggle'); if(passwordToggle) passwordToggle.onclick=()=>{const input=$('#signinPassword');const show=input.type==='password';input.type=show?'text':'password';passwordToggle.textContent=show?'Hide':'Show';passwordToggle.setAttribute('aria-label',show?'Hide password':'Show password');};
++    $$('[data-auth-tab]').forEach(b=>b.onclick=()=>{ $$('[data-auth-tab]').forEach(x=>x.classList.toggle('active',x===b)); $('#signinForm').classList.toggle('hidden',b.dataset.authTab!=='signin'); $('#signupForm').classList.toggle('hidden',b.dataset.authTab!=='signup'); resetAuthVisuals(); });
++    $('#logoutBtn').onclick=()=>db.auth.signOut(); $('#refreshBtn').onclick=()=>go(state.page,true); $('#profileTrigger').onclick=e=>{e.stopPropagation();toggleProfileMenu();}; $$('[data-account-action]').forEach(x=>x.onclick=()=>handleAccountAction(x.dataset.accountAction)); $('#avatarFileInput').onchange=e=>{const f=e.target.files?.[0];if(f)uploadAvatar(f);e.target.value='';}; document.addEventListener('click',e=>{if(!e.target.closest('.profile-control'))closeProfileMenu();}); $('#openNav').onclick=openNav; $('#closeNav').onclick=closeNav; $('#navBackdrop').onclick=closeNav; $('#modalClose').onclick=closeModal; $('#modal').addEventListener('click',e=>{if(e.target===$('#modal'))closeModal();});
+     db.auth.onAuthStateChange(async (event,session)=>{ state.session=session;state.user=session?.user||null; if(session){ if(event==='SIGNED_IN' && interactiveSignin) return; await enterApp(); if(event==='PASSWORD_RECOVERY') setTimeout(openPasswordRecovery,0); } else leaveApp(); });
+     const {data:{session}}=await db.auth.getSession(); state.session=session;state.user=session?.user||null; if(session){ await enterApp(); if(location.hash.includes('type=recovery') || new URLSearchParams(location.search).get('type')==='recovery') setTimeout(openPasswordRecovery,0); } else leaveApp();
+   }
